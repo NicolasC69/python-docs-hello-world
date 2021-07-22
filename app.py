@@ -30,7 +30,7 @@ if 'APPINSIGHTS_KEY' in os.environ:
 # Setup Flask Restful framework
 api = Api(app)
 parser = reqparse.RequestParser()
-parser.add_argument('customer')
+parser.add_argument('employee')
 
 # Implement singleton to avoid global objects
 class ConnectionManager(object):    
