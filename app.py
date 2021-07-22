@@ -1,69 +1,115 @@
-# from flask import Flask
-# app = Flask(__name__)
-
-# @app.route("/")
-# def hello():
-#    return "Hello, GroupBI!"
-
+import sys
+import os
+import json
+import pyodbc
+import socket
 from flask import Flask
 from flask_restful import reqparse, abort, Api, Resource
+from threading import Lock
+from tenacity import *
+from opencensus.ext.azure.trace_exporter import AzureExporter
+from opencensus.ext.flask.flask_middleware import FlaskMiddleware
+from opencensus.trace.samplers import ProbabilitySampler
+import logging
 
+# Initialize connection string
+
+SQLAZURECONNSTR_WWIF = "DRIVER={ODBC Driver 17 for SQL Server};SERVER=akka-groupanalytics-dev-dbserver.database.windows.net;DATABASE=akka-groupanalytics-dev-dwh;UID=PythonWebApp;PWD=a987REALLY#$%TRONGpa44w0rd"
+
+# Initialize Flask
 app = Flask(__name__)
+
+# Setup Azure Monitor
+if 'APPINSIGHTS_KEY' in os.environ:
+    middleware = FlaskMiddleware(
+        app,
+        exporter=AzureExporter(connection_string="InstrumentationKey={0}".format(os.environ['APPINSIGHTS_KEY'])),
+        sampler=ProbabilitySampler(rate=1.0),
+    )
+
+# Setup Flask Restful framework
 api = Api(app)
-
-TODOS = {
-    'todo1': {'task': 'build an API'},
-    'todo2': {'task': '?????'},
-    'todo3': {'task': 'profit!'},
-}
-
-
-def abort_if_todo_doesnt_exist(todo_id):
-    if todo_id not in TODOS:
-        abort(404, message="Todo {} doesn't exist".format(todo_id))
-
 parser = reqparse.RequestParser()
-parser.add_argument('task')
+parser.add_argument('customer')
 
+# Implement singleton to avoid global objects
+class ConnectionManager(object):    
+    __instance = None
+    __connection = None
+    __lock = Lock()
 
-# Todo
-# shows a single todo item and lets you delete a todo item
-class Todo(Resource):
-    def get(self, todo_id):
-        abort_if_todo_doesnt_exist(todo_id)
-        return TODOS[todo_id]
+    def __new__(cls):
+        if ConnectionManager.__instance is None:
+            ConnectionManager.__instance = object.__new__(cls)        
+        return ConnectionManager.__instance       
+    
+    def __getConnection(self):
+        if (self.__connection == None):
+            application_name = ";APP={0}".format(socket.gethostname())  
+            self.__connection = pyodbc.connect(os.environ['SQLAZURECONNSTR_WWIF'] + application_name)                  
+        
+        return self.__connection
 
-    def delete(self, todo_id):
-        abort_if_todo_doesnt_exist(todo_id)
-        del TODOS[todo_id]
-        return '', 204
+    def __removeConnection(self):
+        self.__connection = None
 
-    def put(self, todo_id):
-        args = parser.parse_args()
-        task = {'task': args['task']}
-        TODOS[todo_id] = task
-        return task, 201
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(10), retry=retry_if_exception_type(pyodbc.OperationalError), after=after_log(app.logger, logging.DEBUG))
+    def executeQueryJSON(self, procedure, payload=None):
+        result = {}  
+        try:
+            conn = self.__getConnection()
 
+            cursor = conn.cursor()
+            
+            if payload:
+                cursor.execute(f"EXEC {procedure} ?", json.dumps(payload))
+            else:
+                cursor.execute(f"EXEC {procedure}")
 
-# TodoList
-# shows a list of all todos, and lets you POST to add new tasks
-class TodoList(Resource):
-    def get(self):
-        return TODOS
+            result = cursor.fetchone()
 
-    def post(self):
-        args = parser.parse_args()
-        todo_id = int(max(TODOS.keys()).lstrip('todo')) + 1
-        todo_id = 'todo%i' % todo_id
-        TODOS[todo_id] = {'task': args['task']}
-        return TODOS[todo_id], 201
+            if result:
+                result = json.loads(result[0])                           
+            else:
+                result = {}
 
-##
-## Actually setup the Api resource routing here
-##
-api.add_resource(TodoList, '/todos')
-api.add_resource(Todo, '/todos/<todo_id>')
+            cursor.commit()    
+        except pyodbc.OperationalError as e:            
+            app.logger.error(f"{e.args[1]}")
+            if e.args[0] == "08S01":
+                # If there is a "Communication Link Failure" error, 
+                # then connection must be removed
+                # as it will be in an invalid state
+                self.__removeConnection() 
+                raise                        
+        finally:
+            cursor.close()
+                         
+        return result
 
+class Queryable(Resource):
+    def executeQueryJson(self, verb, payload=None):
+        result = {}  
+        entity = type(self).__name__.lower()
+        procedure = f"web.{verb}_{entity}"
+        result = ConnectionManager().executeQueryJSON(procedure, payload)
+        return result
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# Employee Class
+class Employee(Queryable):
+    def get(self, employee_id):     
+        employee = {}
+        employee["DatamartID"] = employee_id
+        result = self.executeQueryJson("get", employee)   
+        return result, 200
+   
+
+# Employees Class
+class Employees(Queryable):
+    def get(self):     
+        result = self.executeQueryJson("get")   
+        return result, 200
+    
+# Create API routes
+api.add_resource(Employee, '/employee', '/employee/<employee_id>')
+api.add_resource(Employees, '/employees')
